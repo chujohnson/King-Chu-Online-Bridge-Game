@@ -951,6 +951,104 @@
             }
         }
     </style>
+  <script src="https://unpkg.com/@supabase/supabase-js@2"></script>
+
+<script>
+// --- Supabase initialisation & Realtime wiring ---
+const SUPABASE_URL = "https://wcercnbcoeonzumxprne.supabase.co";
+const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndjZXJjbmJjb2Vvbnp1bXhwcm5lIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTY2NDY2MzcsImV4cCI6MjA3MjIyMjYzN30.8x9s7KoUGWdm3FvAfoJ9S9fnE3N7sHZl8xobhs93c5U";
+const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+// Local cache so existing sync code can remain synchronous
+const SUPA_CACHE = {
+  stateByRoom: new Map()
+};
+
+let lastSubscribedRoom = null;
+let roomChannel = null;
+
+// Fetch latest state from Supabase and refresh cache
+async function fetchSharedStateAsync(roomId) {
+  try {
+    const { data, error } = await supabase
+      .from('game_states')
+      .select('state')
+      .eq('roomId', roomId)
+      .single();
+    if (error) {
+      // PGRST116 is "No rows found" (may vary), just treat as null
+      return null;
+    }
+    const s = data?.state;
+    const obj = (typeof s === 'string') ? JSON.parse(s) : s;
+    if (obj) {
+      SUPA_CACHE.stateByRoom.set(roomId, obj);
+    }
+    return obj || null;
+  } catch (e) {
+    console.error('fetchSharedStateAsync error', e);
+    return null;
+  }
+}
+
+// Subscribe to realtime changes for the current room
+function subscribeToRoom(roomId) {
+  if (!roomId) return;
+  if (roomChannel) supabase.removeChannel(roomChannel);
+
+  roomChannel = supabase.channel('room_' + roomId);
+
+  roomChannel.on(
+    'postgres_changes',
+    { event: '*', schema: 'public', table: 'game_states', filter: `roomId=eq.${roomId}` },
+    async (payload) => {
+      try {
+        if (typeof debugLog === 'function') debugLog(`📡 Realtime: ${payload.eventType}`);
+        await fetchSharedStateAsync(roomId);
+        // Trigger your existing sync logic to merge & rerender
+        if (typeof syncFromSharedState === 'function') {
+          await Promise.resolve(syncFromSharedState());
+        }
+      } catch (e) {
+        console.error('Realtime handler error', e);
+      }
+    }
+  );
+
+  roomChannel.subscribe((status) => {
+    if (status === 'SUBSCRIBED' && typeof debugLog === 'function') {
+      debugLog(`✅ Realtime subscribed to room ${roomId}`);
+    }
+  });
+
+  lastSubscribedRoom = roomId;
+}
+
+// Auto-detect when roomId becomes available or changes and (1) subscribe, (2) seed cache
+const _supabaseRoomWatch = setInterval(async () => {
+  try {
+    const rid = (typeof myPlayerInfo !== 'undefined' && myPlayerInfo && myPlayerInfo.roomId) ? myPlayerInfo.roomId : null;
+    if (rid && rid !== lastSubscribedRoom) {
+      await fetchSharedStateAsync(rid);  // seed cache first
+      subscribeToRoom(rid);
+      if (typeof debugLog === 'function') debugLog(`🔎 Detected room ${rid} — cache seeded and realtime on.`);
+    }
+  } catch (e) {
+    // ignore until myPlayerInfo exists
+  }
+}, 800);
+
+// Optional: light polling as a fallback (every 3s) to heal missed events
+setInterval(async () => {
+  try {
+    const rid = (typeof myPlayerInfo !== 'undefined' && myPlayerInfo && myPlayerInfo.roomId) ? myPlayerInfo.roomId : null;
+    if (rid) {
+      await fetchSharedStateAsync(rid);
+    }
+  } catch (e) {}
+}, 3000);
+</script>
+
 </head>
 <body>
     <!-- Debug Log -->
@@ -1206,27 +1304,46 @@
         // ================================
         
         function getSharedState() {
-            try {
-                const stored = localStorage.getItem(SHARED_STATE_KEY);
-                return stored ? JSON.parse(stored) : null;
-            } catch (e) {
-                debugLog(`Error reading shared state: ${e.message}`);
-                return null;
-            }
-        }
+  try {
+    const rid = (typeof myPlayerInfo !== 'undefined' && myPlayerInfo && myPlayerInfo.roomId) ? myPlayerInfo.roomId : null;
+    if (!rid) return null;
+    const cached = SUPA_CACHE.stateByRoom.get(rid);
+    return cached ? JSON.parse(JSON.stringify(cached)) : null; // return deep copy
+  } catch (e) {
+    if (typeof debugLog === 'function') debugLog(`Error reading shared state (cache): ${e.message}`);
+    return null;
+  }
+}
         
         function saveSharedState(state) {
-            try {
-                state.lastUpdate = Date.now();
-                state.version = (state.version || 0) + 1;
-                localStorage.setItem(SHARED_STATE_KEY, JSON.stringify(state));
-                debugLog(`✅ Shared state saved - Version: ${state.version}, Update: ${state.lastUpdate}`);
-                return true;
-            } catch (e) {
-                debugLog(`❌ Error saving shared state: ${e.message}`);
-                return false;
-            }
-        }
+  try {
+    const rid = (typeof myPlayerInfo !== 'undefined' && myPlayerInfo && myPlayerInfo.roomId) ? myPlayerInfo.roomId : null;
+    if (!rid) {
+      if (typeof debugLog === 'function') debugLog('❌ Error saving shared state: missing roomId');
+      return false;
+    }
+    state.lastUpdate = Date.now();
+    state.version = (state.version || 0) + 1;
+
+    // Update local cache immediately so existing UI remains responsive
+    SUPA_CACHE.stateByRoom.set(rid, JSON.parse(JSON.stringify(state)));
+
+    // Persist asynchronously to Supabase
+    (async () => {
+      const payload = { roomId: rid, state: state };
+      const { error } = await supabase.from('game_states').upsert(payload);
+      if (error && typeof debugLog === 'function') {
+        debugLog(`❌ Supabase upsert error: ${error.message}`);
+      }
+    })();
+
+    if (typeof debugLog === 'function') debugLog(`✅ Shared state saved - Version: ${state.version}, Update: ${state.lastUpdate}`);
+    return true;
+  } catch (e) {
+    if (typeof debugLog === 'function') debugLog(`❌ Error saving shared state: ${e.message}`);
+    return false;
+  }
+}
         
         function syncFromSharedState() {
             const sharedState = getSharedState();
