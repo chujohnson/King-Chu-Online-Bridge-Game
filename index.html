@@ -1004,6 +1004,17 @@ function subscribeToRoom(roomId) {
     async (payload) => {
       try {
         if (typeof debugLog === 'function') debugLog(`📡 Realtime: ${payload.eventType}`);
+        const rid = (typeof myPlayerInfo !== 'undefined' && myPlayerInfo && myPlayerInfo.roomId) ? myPlayerInfo.roomId : null;
+        if (rid) {
+          await fetchSharedStateAsync(rid);
+          if (typeof syncFromSharedState === 'function') {
+            syncFromSharedState(); // force apply new state
+          }
+        }
+      } catch (e) {
+        console.error('Realtime handler error', e);
+      }
+    }`);
         await fetchSharedStateAsync(roomId);
         // Trigger your existing sync logic to merge & rerender
         if (typeof syncFromSharedState === 'function') {
@@ -1322,25 +1333,36 @@ setInterval(async () => {
       if (typeof debugLog === 'function') debugLog('❌ Error saving shared state: missing roomId');
       return false;
     }
-    state.lastUpdate = Date.now();
-    state.version = (state.version || 0) + 1;
-
-    // Update local cache immediately so existing UI remains responsive
-    SUPA_CACHE.stateByRoom.set(rid, JSON.parse(JSON.stringify(state)));
-
-    // Persist asynchronously to Supabase
     (async () => {
-      const payload = { roomId: rid, state: state };
-      const { error } = await supabase.from('game_states').upsert(payload);
-      if (error && typeof debugLog === 'function') {
-        debugLog(`❌ Supabase upsert error: ${error.message}`);
+      try {
+        // Get current version from Supabase
+        const { data, error } = await supabase.from('game_states').select('state').eq('roomId', rid).single();
+        let latestVersion = 0;
+        if (!error && data && data.state) {
+          const s = typeof data.state === 'string' ? JSON.parse(data.state) : data.state;
+          latestVersion = s.version || 0;
+        }
+        state.lastUpdate = Date.now();
+        state.version = latestVersion + 1;
+
+        // Update local cache immediately
+        SUPA_CACHE.stateByRoom.set(rid, JSON.parse(JSON.stringify(state)));
+
+        // Persist asynchronously to Supabase
+        const payload = { roomId: rid, state: state };
+        const { error: upsertError } = await supabase.from('game_states').upsert(payload);
+        if (upsertError && typeof debugLog === 'function') {
+          debugLog(`❌ Supabase upsert error: ${upsertError.message}`);
+        } else {
+          if (typeof debugLog === 'function') debugLog(`✅ Shared state saved - Version: ${state.version}, Update: ${state.lastUpdate}`);
+        }
+      } catch (inner) {
+        if (typeof debugLog === 'function') debugLog(`❌ Error during saveSharedState async: ${inner.message}`);
       }
     })();
-
-    if (typeof debugLog === 'function') debugLog(`✅ Shared state saved - Version: ${state.version}, Update: ${state.lastUpdate}`);
     return true;
   } catch (e) {
-    if (typeof debugLog === 'function') debugLog(`❌ Error saving shared state: ${e.message}`);
+    if (typeof debugLog === 'function') debugLog(`❌ Error saving shared state wrapper: ${e.message}`);
     return false;
   }
 }
